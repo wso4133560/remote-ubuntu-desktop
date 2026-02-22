@@ -10,11 +10,19 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [isAuthenticated, setIsAuthenticated] = useState(false)
+  const [isAuthenticated, setIsAuthenticated] = useState(() => {
+    if (typeof window === 'undefined') {
+      return false
+    }
+    return !!window.localStorage.getItem('access_token')
+  })
 
   useEffect(() => {
-    const token = localStorage.getItem('access_token')
-    setIsAuthenticated(!!token)
+    const onStorage = () => {
+      setIsAuthenticated(!!window.localStorage.getItem('access_token'))
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
   }, [])
 
   const login = async (username: string, password: string) => {

@@ -44,6 +44,7 @@ private:
     bool probeEncoder(const std::string& name);
     std::string buildPipelineStr(const std::string& encoder);
     bool linkPayloaderToWebrtc();
+    void applyPayloaderPayloadType(int payloadType);
 
     static void onNegotiationNeeded(GstElement* webrtc, gpointer user_data);
     static void onIceCandidate(GstElement* webrtc, guint mline, gchar* candidate, gpointer user_data);

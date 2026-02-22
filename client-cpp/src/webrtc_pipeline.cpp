@@ -2,6 +2,7 @@
 #include "config.h"
 #include <gst/webrtc/webrtc.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <iostream>
 #include <sstream>
@@ -17,6 +18,25 @@ static int findVideoMLineIndex(const std::string& sdp) {
         mline++;
     }
     return 0;
+}
+
+static int findVideoPayloadType(const GstSDPMessage* sdp) {
+    if (!sdp) return -1;
+    const guint mediaCount = gst_sdp_message_medias_len(sdp);
+    for (guint i = 0; i < mediaCount; ++i) {
+        const GstSDPMedia* media = gst_sdp_message_get_media(sdp, i);
+        if (!media) continue;
+        const gchar* mediaType = gst_sdp_media_get_media(media);
+        if (!mediaType || std::string(mediaType) != "video") continue;
+        const gchar* firstFmt = gst_sdp_media_get_format(media, 0);
+        if (!firstFmt) continue;
+        try {
+            return std::stoi(firstFmt);
+        } catch (...) {
+            return -1;
+        }
+    }
+    return -1;
 }
 
 static std::string getDataChannelLabel(GstWebRTCDataChannel* channel) {
@@ -41,22 +61,48 @@ bool WebRTCPipeline::probeEncoder(const std::string& name) {
 }
 
 std::string WebRTCPipeline::selectEncoder() {
-    const char* forcedCodec = getenv("RC_VIDEO_CODEC");
-    if (forcedCodec && std::string(forcedCodec) == "h264") {
-        std::cout << "[ENC] RC_VIDEO_CODEC=h264, forcing H264 path\n";
-    } else {
-        if (probeEncoder("vp8enc")) {
-            std::cout << "[ENC] Selected: vp8enc (compatibility default)\n";
-            return "vp8enc";
+    const char* forcedEncoder = getenv("RC_VIDEO_ENCODER");
+    if (forcedEncoder && *forcedEncoder) {
+        std::string forced(forcedEncoder);
+        if (probeEncoder(forced)) {
+            std::cout << "[ENC] Selected: " << forced << " (forced via RC_VIDEO_ENCODER)\n";
+            return forced;
         }
+        std::cerr << "[ENC] RC_VIDEO_ENCODER=" << forced
+                  << " unavailable, continuing with auto selection\n";
     }
 
-    // Compatibility-first: software encoder is more reliable across browsers.
-    // Set RC_PREFER_HW_ENCODER=1 to prefer hardware encoders.
-    const char* preferHw = getenv("RC_PREFER_HW_ENCODER");
-    bool useHwFirst = preferHw && std::string(preferHw) == "1";
+    std::string codecMode = "auto";
+    const char* codecEnv = getenv("RC_VIDEO_CODEC");
+    if (codecEnv && *codecEnv) codecMode = codecEnv;
+    std::transform(
+        codecMode.begin(), codecMode.end(), codecMode.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-    if (useHwFirst) {
+    const char* preferHwEnv = getenv("RC_PREFER_HW_ENCODER");
+    bool useHwFirst = true;
+    if (preferHwEnv && std::string(preferHwEnv) == "0") useHwFirst = false;
+
+    bool autoMode = (codecMode == "auto");
+    bool h264Mode = (codecMode == "h264");
+    bool vp8Mode = (codecMode == "vp8");
+    if (!autoMode && !h264Mode && !vp8Mode) {
+        std::cerr << "[ENC] Unknown RC_VIDEO_CODEC=" << codecMode
+                  << ", falling back to auto\n";
+        autoMode = true;
+    }
+
+    if (vp8Mode) {
+        if (probeEncoder("vp8enc")) {
+            std::cout << "[ENC] Selected: vp8enc (forced via RC_VIDEO_CODEC=vp8)\n";
+            return "vp8enc";
+        }
+        std::cerr << "[ENC] RC_VIDEO_CODEC=vp8 but vp8enc unavailable, falling back to auto\n";
+        autoMode = true;
+        vp8Mode = false;
+    }
+
+    if (h264Mode || (autoMode && useHwFirst)) {
         if (probeEncoder("nvh264enc")) {
             std::cout << "[ENC] Selected: nvh264enc (NVIDIA hardware)\n";
             return "nvh264enc";
@@ -67,22 +113,30 @@ std::string WebRTCPipeline::selectEncoder() {
         }
     }
 
+    if (autoMode && probeEncoder("vp8enc")) {
+        std::cout << "[ENC] Selected: vp8enc (software compatibility fallback)\n";
+        return "vp8enc";
+    }
+
     if (probeEncoder("x264enc")) {
-        std::cout << "[ENC] Selected: x264enc (software)\n";
+        std::cout << "[ENC] Selected: x264enc (software fallback)\n";
         return "x264enc";
     }
 
-    // If software encoder is unavailable, fall back to hardware candidates.
+    if (probeEncoder("vp8enc")) {
+        std::cout << "[ENC] Selected: vp8enc (last software fallback)\n";
+        return "vp8enc";
+    }
     if (probeEncoder("nvh264enc")) {
-        std::cout << "[ENC] Selected: nvh264enc (NVIDIA hardware fallback)\n";
+        std::cout << "[ENC] Selected: nvh264enc (late fallback)\n";
         return "nvh264enc";
     }
     if (probeEncoder("vaapih264enc")) {
-        std::cout << "[ENC] Selected: vaapih264enc (VAAPI hardware fallback)\n";
+        std::cout << "[ENC] Selected: vaapih264enc (late fallback)\n";
         return "vaapih264enc";
     }
 
-    std::cout << "[ENC] No preferred encoder found, using x264enc\n";
+    std::cout << "[ENC] No encoder detected, defaulting to x264enc\n";
     return "x264enc";
 }
 
@@ -242,6 +296,18 @@ bool WebRTCPipeline::linkPayloaderToWebrtc() {
     return ok;
 }
 
+void WebRTCPipeline::applyPayloaderPayloadType(int payloadType) {
+    if (!pipeline_ || payloadType < 0) return;
+    GstElement* payloader = gst_bin_get_by_name(GST_BIN(pipeline_), "rtppay0");
+    if (!payloader) {
+        std::cerr << "[GST] Cannot set payloader pt: rtppay0 not found\n";
+        return;
+    }
+    g_object_set(payloader, "pt", (guint)payloadType, nullptr);
+    std::cout << "[GST] Updated rtppay0 pt to negotiated payload: " << payloadType << "\n";
+    gst_object_unref(payloader);
+}
+
 void WebRTCPipeline::handleOffer(const std::string& sdp) {
     answerRetryCount_ = 0;
     videoMLineIndex_ = findVideoMLineIndex(sdp);
@@ -298,6 +364,13 @@ void WebRTCPipeline::onAnswerCreated(GstPromise* promise, gpointer user_data) {
         return;
     }
     self->answerRetryCount_ = 0;
+
+    int negotiatedPt = findVideoPayloadType(answer->sdp);
+    if (negotiatedPt >= 0) {
+        self->applyPayloaderPayloadType(negotiatedPt);
+    } else {
+        std::cerr << "[SDP-ANSWER] Could not parse negotiated video payload type\n";
+    }
 
     GstPromise* localPromise = gst_promise_new();
     g_signal_emit_by_name(self->webrtcbin_, "set-local-description", answer, localPromise);

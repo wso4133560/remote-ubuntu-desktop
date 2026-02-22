@@ -85,13 +85,19 @@ The binary reads the same `config.json` as the Python client.
 
 ## Encoder selection
 
-At startup the binary probes encoders in order:
+Default startup strategy is hardware-first:
 
-1. `nvh264enc` — NVIDIA NVENC (requires NVIDIA GPU + driver)
-2. `vaapih264enc` — VAAPI (Intel/AMD GPU)
-3. `x264enc` — software fallback (always available)
+1. Try `nvh264enc` (NVIDIA NVENC)
+2. Try `vaapih264enc` (VAAPI on Intel/AMD)
+3. Fall back to software (`vp8enc`, then `x264enc`)
 
-Set `RC_VIDEO_ENCODER` env var to force a specific encoder:
+Useful environment variables:
+
+- `RC_VIDEO_CODEC=auto|h264|vp8` (default: `auto`)
+- `RC_PREFER_HW_ENCODER=1|0` (default: `1`)
+- `RC_VIDEO_ENCODER=<exact_gstreamer_encoder_name>` to force a specific encoder (for debugging)
+
+Example forcing software H.264:
 
 ```bash
 RC_VIDEO_ENCODER=x264enc ./remote-desktop-client config.json

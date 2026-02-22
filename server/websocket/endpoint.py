@@ -6,8 +6,9 @@ from sqlalchemy import select
 from .connection_manager import connection_manager
 from .auth import authenticate_websocket, handle_heartbeat
 from .router import message_router
-from ..models.models import Device
+from ..models.models import Device, Session as SessionModel
 from ..database.database import get_database
+from ..protocol.states import SessionState
 
 router = APIRouter()
 
@@ -45,6 +46,24 @@ async def websocket_endpoint(
             )
             device = result.scalar_one_or_none()
             if device:
+                # Recover from stale sessions left by abrupt frontend/server exits.
+                stale_sessions = await session.execute(
+                    select(SessionModel).where(
+                        SessionModel.device_id == device.id,
+                        SessionModel.ended_at.is_(None),
+                    )
+                )
+                for stale in stale_sessions.scalars().all():
+                    if stale.ended_at is None and stale.state in (
+                        SessionState.PENDING,
+                        SessionState.NEGOTIATING,
+                        SessionState.ACTIVE,
+                    ):
+                        stale.state = SessionState.ENDING
+                        stale.ended_at = datetime.utcnow()
+                        stale.end_reason = "device_reconnected_cleanup"
+                        session.add(stale)
+
                 device.status = "online"
                 device.last_seen = datetime.utcnow()
                 session.add(device)
