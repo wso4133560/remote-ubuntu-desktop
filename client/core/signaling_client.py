@@ -215,7 +215,8 @@ class SignalingClient:
             print("Initializing video capture...", flush=True)
             target_width = min(max(640, int(self.config.video_width)), 1280)
             target_height = min(max(360, int(self.config.video_height)), 720)
-            target_fps = min(max(15, int(self.config.video_fps)), 60)
+            configured_fps = int(self.config.video_fps)
+            target_fps = min(max(configured_fps, 60), 60)
             print(
                 f"Video profile: {target_width}x{target_height}@{target_fps}fps "
                 f"(configured {self.config.video_width}x{self.config.video_height}@{self.config.video_fps})",

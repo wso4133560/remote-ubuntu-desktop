@@ -1,5 +1,6 @@
 """剪贴板同步基础框架"""
 import asyncio
+import os
 from typing import Optional, Callable
 import subprocess
 import shutil
@@ -15,12 +16,14 @@ class ClipboardManager:
         self.monitor_task: Optional[asyncio.Task] = None
         self.use_wl_clipboard = False
         self.use_xclip = False
+        self.use_xsel = False
 
     def check_dependencies(self) -> dict:
         """检查依赖项"""
         dependencies = {
             "wl-clipboard": False,
             "xclip": False,
+            "xsel": False,
         }
 
         # 检查 wl-clipboard (Wayland)
@@ -28,6 +31,7 @@ class ClipboardManager:
 
         # 检查 xclip (X11 fallback)
         dependencies["xclip"] = shutil.which("xclip") is not None
+        dependencies["xsel"] = shutil.which("xsel") is not None
 
         return dependencies
 
@@ -39,21 +43,38 @@ class ClipboardManager:
             status = "✓" if available else "✗"
             print(f"  {status} {dep}")
 
-        if dependencies["wl-clipboard"]:
+        prefer_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+
+        if prefer_wayland and dependencies["wl-clipboard"]:
             print("Using wl-clipboard for Wayland")
             self.use_wl_clipboard = True
             self.use_xclip = False
+            self.use_xsel = False
             return True
-        elif dependencies["xclip"]:
+
+        if dependencies["xclip"]:
             print("Using xclip (X11 fallback)")
             self.use_wl_clipboard = False
             self.use_xclip = True
+            self.use_xsel = False
             return True
-        else:
-            print("No clipboard tool available")
+
+        if dependencies["xsel"]:
+            print("Using xsel (X11 fallback)")
             self.use_wl_clipboard = False
             self.use_xclip = False
-            return False
+            self.use_xsel = True
+            return True
+
+        print(
+            "No clipboard tool available. Install one of: "
+            "`sudo apt install wl-clipboard` (Wayland) or "
+            "`sudo apt install xclip` / `sudo apt install xsel` (X11)"
+        )
+        self.use_wl_clipboard = False
+        self.use_xclip = False
+        self.use_xsel = False
+        return False
 
     async def start_monitoring(self):
         """开始监控剪贴板变化"""
@@ -113,6 +134,16 @@ class ClipboardManager:
                 if result.returncode == 0:
                     return result.stdout
 
+            if self.use_xsel:
+                result = subprocess.run(
+                    ["xsel", "--clipboard", "--output"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1
+                )
+                if result.returncode == 0:
+                    return result.stdout
+
         except Exception as e:
             print(f"Error getting clipboard: {e}")
 
@@ -137,6 +168,19 @@ class ClipboardManager:
             if self.use_xclip:
                 result = subprocess.run(
                     ["xclip", "-i", "-selection", "clipboard"],
+                    input=content,
+                    text=True,
+                    capture_output=True,
+                    timeout=1
+                )
+                if result.returncode == 0:
+                    self.last_content = content
+                    print(f"Clipboard set: {len(content)} chars")
+                    return
+
+            if self.use_xsel:
+                result = subprocess.run(
+                    ["xsel", "--clipboard", "--input"],
                     input=content,
                     text=True,
                     capture_output=True,

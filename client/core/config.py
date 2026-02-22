@@ -19,7 +19,7 @@ class ClientConfig(BaseModel):
 
     video_width: int = Field(1920, description="视频宽度")
     video_height: int = Field(1080, description="视频高度")
-    video_fps: int = Field(30, description="视频帧率")
+    video_fps: int = Field(60, description="视频帧率")
     video_bitrate: int = Field(2000000, description="视频比特率")
 
     enable_audio: bool = Field(True, description="启用音频")

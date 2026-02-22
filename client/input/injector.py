@@ -67,9 +67,17 @@ class InputInjector:
             status = "✓" if available else "✗"
             print(f"  {status} {dep}")
 
+        gnome_runtime_ready = dependencies.get("python-gi", False) and dependencies.get("python-dbus", False)
+
         candidates = []
         if self.injection_method == "gnome-remote-desktop":
-            candidates.append(("gnome-remote-desktop", self._init_gnome_injection))
+            if gnome_runtime_ready:
+                candidates.append(("gnome-remote-desktop", self._init_gnome_injection))
+            else:
+                print(
+                    "Skipping GNOME Remote Desktop injector: missing python gi/dbus runtime "
+                    "(install python3-gi and python3-dbus to enable it)"
+                )
             candidates.append(("x11-xtest", self._init_x11_injection))
         elif self.injection_method == "wlroots-protocols":
             candidates.append(("wlroots-protocols", self._init_wlroots_injection))
