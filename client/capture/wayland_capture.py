@@ -1,0 +1,381 @@
+"""桌面视频捕获（Wayland 检测 + X11 回退）"""
+import asyncio
+import os
+import shutil
+import subprocess
+import time
+from io import BytesIO
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+from aiortc import VideoStreamTrack
+from av import VideoFrame
+
+try:
+    from PIL import Image, ImageGrab, UnidentifiedImageError
+except Exception:
+    Image = None
+    ImageGrab = None
+    UnidentifiedImageError = Exception
+
+try:
+    from Xlib import display as XDisplay
+except Exception:
+    XDisplay = None
+
+
+class WaylandCapture:
+    """Wayland 屏幕捕获管理器"""
+
+    def __init__(self):
+        self.compositor_type: Optional[str] = None
+        self.capture_method: Optional[str] = None
+
+    async def detect_compositor(self) -> str:
+        """检测 Wayland compositor 类型"""
+        try:
+            session_type = os.getenv("XDG_SESSION_TYPE", "").lower()
+            if "wayland" not in session_type:
+                raise Exception("Not running on Wayland")
+
+            # 检测 compositor 类型
+            # 检查 GNOME
+            result = subprocess.run(
+                ["pgrep", "-x", "gnome-shell"],
+                capture_output=True
+            )
+            if result.returncode == 0:
+                self.compositor_type = "gnome"
+                self.capture_method = "xdg-desktop-portal"
+                return "GNOME (Mutter)"
+
+            # 检查 wlroots-based (Sway, etc.)
+            result = subprocess.run(
+                ["pgrep", "-x", "sway"],
+                capture_output=True
+            )
+            if result.returncode == 0:
+                self.compositor_type = "wlroots"
+                self.capture_method = "wlr-screencopy"
+                return "Sway (wlroots)"
+
+            # 未知 compositor
+            self.compositor_type = "unknown"
+            self.capture_method = None
+            return "Unknown"
+
+        except Exception as e:
+            print(f"Error detecting compositor: {e}")
+            return "Error"
+
+    def check_dependencies(self) -> dict:
+        """检查依赖项"""
+        dependencies = {
+            "xdg-desktop-portal": False,
+            "xdg-desktop-portal-gnome": False,
+            "xdg-desktop-portal-wlr": False,
+            "pipewire": False,
+            "grim": False,
+        }
+
+        dependencies["xdg-desktop-portal"] = shutil.which("xdg-desktop-portal") is not None
+        dependencies["xdg-desktop-portal-gnome"] = shutil.which("xdg-desktop-portal-gnome") is not None
+        dependencies["xdg-desktop-portal-wlr"] = shutil.which("xdg-desktop-portal-wlr") is not None
+        dependencies["pipewire"] = shutil.which("pipewire") is not None
+        dependencies["grim"] = shutil.which("grim") is not None
+
+        return dependencies
+
+    async def initialize(self) -> bool:
+        """初始化屏幕捕获"""
+        compositor = await self.detect_compositor()
+        print(f"Detected compositor: {compositor}")
+
+        dependencies = self.check_dependencies()
+        print("Dependencies:")
+        for dep, available in dependencies.items():
+            status = "✓" if available else "✗"
+            print(f"  {status} {dep}")
+
+        if self.capture_method == "xdg-desktop-portal":
+            return await self._init_portal_capture()
+        elif self.capture_method == "wlr-screencopy":
+            return await self._init_wlr_capture()
+        else:
+            print("No supported capture method available")
+            return False
+
+    async def _init_portal_capture(self) -> bool:
+        """初始化 XDG Desktop Portal 捕获"""
+        print("Initializing XDG Desktop Portal capture...")
+        # TODO: 后续可接入 xdg-desktop-portal + PipeWire
+        return False
+
+    async def _init_wlr_capture(self) -> bool:
+        """初始化 wlr-screencopy 捕获"""
+        print("Initializing wlr-screencopy capture...")
+        # TODO: 实现 wlr-screencopy 捕获
+        # 需要使用 Wayland 协议
+        return False
+
+
+class WaylandVideoTrack(VideoStreamTrack):
+    """桌面视频轨道（优先真实屏幕，失败后测试图案）"""
+
+    def __init__(self, width=1920, height=1080, fps=30):
+        super().__init__()
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.capture = WaylandCapture()
+        self.initialized = False
+        self.backend = "test-pattern"
+        self.display: Optional[str] = None
+        self.xauthority: Optional[str] = None
+        self._last_capture_error_at = 0.0
+        self._frame_count = 0
+        self._x11_pointer_display = None
+        self._x11_screen_width = 1
+        self._x11_screen_height = 1
+
+    async def initialize(self):
+        """初始化捕获"""
+        wayland_ready = await self.capture.initialize()
+        if wayland_ready:
+            print("Wayland backend detected but not fully implemented, trying X11 capture fallback")
+
+        self.backend = self._select_capture_backend()
+        self.initialized = self.backend != "test-pattern"
+        if self.backend.startswith("x11-"):
+            self._init_x11_pointer_overlay()
+        print(f"Video capture backend: {self.backend}")
+        if not self.initialized:
+            print("Warning: desktop capture not available, using test pattern")
+
+    async def recv(self):
+        """接收视频帧"""
+        pts, time_base = await self.next_timestamp()
+
+        frame_data = None
+        try:
+            if self.backend == "x11-imagegrab":
+                frame_data = self._capture_with_imagegrab()
+            elif self.backend == "x11-import":
+                frame_data = self._capture_with_import()
+        except Exception as e:
+            now = time.time()
+            if now - self._last_capture_error_at > 5:
+                print(f"Screen capture failed on backend={self.backend}: {e}")
+                self._last_capture_error_at = now
+
+        if frame_data is None:
+            frame_data = self._generate_test_pattern_frame()
+        elif self.backend.startswith("x11-"):
+            self._overlay_x11_cursor(frame_data)
+
+        frame = VideoFrame.from_ndarray(frame_data, format="rgb24")
+        frame.pts = pts
+        frame.time_base = time_base
+        return frame
+
+    def _select_capture_backend(self) -> str:
+        context = self._find_x11_context()
+        if context:
+            self.display, self.xauthority = context
+            self._apply_x11_env()
+
+            if ImageGrab is not None:
+                try:
+                    self._capture_with_imagegrab()
+                    return "x11-imagegrab"
+                except Exception as e:
+                    print(f"ImageGrab backend unavailable: {e}")
+
+            if shutil.which("import") is not None:
+                try:
+                    self._capture_with_import()
+                    return "x11-import"
+                except Exception as e:
+                    print(f"ImageMagick import backend unavailable: {e}")
+
+        return "test-pattern"
+
+    def _find_x11_context(self) -> Optional[tuple[str, Optional[str]]]:
+        display_candidates = []
+
+        x11_dir = Path("/tmp/.X11-unix")
+        if x11_dir.exists():
+            sockets = sorted(x11_dir.glob("X*"))
+            for socket in sockets:
+                suffix = socket.name[1:]
+                if suffix.isdigit():
+                    display = f":{suffix}"
+                    if display not in display_candidates:
+                        display_candidates.append(display)
+
+        env_display = os.getenv("DISPLAY")
+        if env_display and env_display not in display_candidates:
+            display_candidates.append(env_display)
+
+        if not display_candidates:
+            return None
+
+        xauth_candidates = []
+        env_xauth = os.getenv("XAUTHORITY")
+        if env_xauth:
+            xauth_candidates.append(env_xauth)
+
+        gdm_xauth = f"/run/user/{os.getuid()}/gdm/Xauthority"
+        if gdm_xauth not in xauth_candidates:
+            xauth_candidates.append(gdm_xauth)
+
+        home_xauth = str(Path.home() / ".Xauthority")
+        if home_xauth not in xauth_candidates:
+            xauth_candidates.append(home_xauth)
+
+        existing_xauth = [p for p in xauth_candidates if Path(p).exists()]
+        if not existing_xauth:
+            existing_xauth = [None]
+
+        for display in display_candidates:
+            for xauth in existing_xauth:
+                if self._can_open_display(display, xauth):
+                    return display, xauth
+
+        # 如果检测命令不可用，至少返回环境里给的 DISPLAY 让运行时再尝试
+        return display_candidates[0], existing_xauth[0]
+
+    def _can_open_display(self, display: str, xauth: Optional[str]) -> bool:
+        if shutil.which("xdpyinfo") is None:
+            return True
+        env = os.environ.copy()
+        env["DISPLAY"] = display
+        if xauth:
+            env["XAUTHORITY"] = xauth
+        else:
+            env.pop("XAUTHORITY", None)
+        result = subprocess.run(
+            ["xdpyinfo"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        )
+        return result.returncode == 0
+
+    def _apply_x11_env(self):
+        if self.display:
+            os.environ["DISPLAY"] = self.display
+        if self.xauthority:
+            os.environ["XAUTHORITY"] = self.xauthority
+
+    def _init_x11_pointer_overlay(self):
+        if XDisplay is None:
+            return
+
+        try:
+            self._apply_x11_env()
+            self._x11_pointer_display = XDisplay.Display(self.display or os.environ.get("DISPLAY"))
+            screen = self._x11_pointer_display.screen()
+            self._x11_screen_width = max(1, int(screen.width_in_pixels))
+            self._x11_screen_height = max(1, int(screen.height_in_pixels))
+            print(
+                "Enabled X11 cursor overlay "
+                f"({self._x11_screen_width}x{self._x11_screen_height})"
+            )
+        except Exception as e:
+            print(f"X11 cursor overlay disabled: {e}")
+            self._x11_pointer_display = None
+
+    def _overlay_x11_cursor(self, frame_data: np.ndarray):
+        if self._x11_pointer_display is None:
+            return
+
+        try:
+            pointer = self._x11_pointer_display.screen().root.query_pointer()
+            src_x = int(pointer.root_x)
+            src_y = int(pointer.root_y)
+        except Exception:
+            return
+
+        x = int(src_x * self.width / max(1, self._x11_screen_width))
+        y = int(src_y * self.height / max(1, self._x11_screen_height))
+        x = max(0, min(self.width - 1, x))
+        y = max(0, min(self.height - 1, y))
+        size = max(8, min(self.width, self.height) // 80)
+
+        self._draw_cross(frame_data, x, y, size + 1, (0, 0, 0), thickness=3)
+        self._draw_cross(frame_data, x, y, size, (255, 255, 255), thickness=1)
+
+    def _draw_cross(
+        self,
+        frame_data: np.ndarray,
+        x: int,
+        y: int,
+        radius: int,
+        color: tuple[int, int, int],
+        thickness: int = 1,
+    ):
+        h, w, _ = frame_data.shape
+        half = max(0, thickness // 2)
+
+        y0 = max(0, y - half)
+        y1 = min(h, y + half + 1)
+        x0 = max(0, x - radius)
+        x1 = min(w, x + radius + 1)
+        frame_data[y0:y1, x0:x1] = color
+
+        x0 = max(0, x - half)
+        x1 = min(w, x + half + 1)
+        y0 = max(0, y - radius)
+        y1 = min(h, y + radius + 1)
+        frame_data[y0:y1, x0:x1] = color
+
+    def _resize_rgb(self, image):
+        image = image.convert("RGB")
+        if image.size != (self.width, self.height):
+            if hasattr(Image, "Resampling"):
+                image = image.resize((self.width, self.height), Image.Resampling.BILINEAR)
+            else:
+                image = image.resize((self.width, self.height), Image.BILINEAR)
+        # Ensure frame is writable for cursor overlay drawing.
+        return np.array(image, dtype=np.uint8, copy=True)
+
+    def _capture_with_imagegrab(self) -> np.ndarray:
+        if ImageGrab is None:
+            raise RuntimeError("Pillow ImageGrab is not available")
+        self._apply_x11_env()
+        image = ImageGrab.grab()
+        return self._resize_rgb(image)
+
+    def _capture_with_import(self) -> np.ndarray:
+        self._apply_x11_env()
+        cmd = ["import", "-window", "root", "png:-"]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=2,
+            check=False,
+            env=os.environ.copy(),
+        )
+        if result.returncode != 0:
+            stderr_text = result.stderr.decode("utf-8", errors="ignore")
+            raise RuntimeError(stderr_text.strip() or f"import exited with code {result.returncode}")
+        if Image is None:
+            raise RuntimeError("Pillow Image is not available")
+        try:
+            image = Image.open(BytesIO(result.stdout))
+        except (UnidentifiedImageError, OSError) as e:
+            raise RuntimeError(f"cannot decode screenshot: {e}") from e
+        return self._resize_rgb(image)
+
+    def _generate_test_pattern_frame(self) -> np.ndarray:
+        """生成测试帧（仅在无法访问真实桌面时使用）"""
+        frame_data = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        frame_data[:, :] = [40, 40, 40]
+        bar_width = max(80, self.width // 10)
+        offset = (self._frame_count * 8) % max(1, self.width - bar_width)
+        frame_data[:, offset:offset + bar_width] = [65, 110, 185]
+        self._frame_count += 1
+        return frame_data

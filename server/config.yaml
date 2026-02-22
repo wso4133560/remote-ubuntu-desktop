@@ -1,0 +1,28 @@
+# 环境配置示例
+# 复制此文件为 .env 并修改配置
+
+# 数据库
+DATABASE_URL=sqlite+aiosqlite:///./remote_control.db
+
+# JWT 密钥（生产环境必须修改）
+SECRET_KEY="DKQKu2Y7Ch53eOgLxvOQiTd5nh5WVmIUJFqEzdFNVlw"
+
+# 服务器
+HOST=0.0.0.0
+PORT=8000
+DEBUG=false
+
+# CORS（生产环境应限制来源）
+CORS_ORIGINS=["http://localhost:3000","https://your-domain.com"]
+
+# 日志
+LOG_LEVEL=INFO
+
+# 性能
+MAX_CONNECTIONS=100
+HEARTBEAT_INTERVAL=30
+SESSION_TIMEOUT=30
+
+# 安全
+ACCOUNT_LOCK_ATTEMPTS=5
+ACCOUNT_LOCK_DURATION=30
