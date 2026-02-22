@@ -318,8 +318,13 @@ void SignalingClient::handleControlMessage(const std::string& json) {
         if (json_object_has_member(root, "key_code") && json_object_has_member(root, "pressed")) {
             std::string keyCode = json_object_get_string_member(root, "key_code");
             bool pressed = json_object_get_boolean_member(root, "pressed");
-            inputInjector_->injectKey(keyCode, pressed);
+            bool repeat = json_object_has_member(root, "repeat")
+                ? json_object_get_boolean_member(root, "repeat")
+                : false;
+            inputInjector_->injectKey(keyCode, pressed, repeat);
         }
+    } else if (type == "key_release_all") {
+        inputInjector_->releaseAllKeys();
     }
 
     g_object_unref(parser);
@@ -331,6 +336,7 @@ void SignalingClient::handleSessionEnd() {
     }
     std::cout << "[SESSION] Ended\n";
     if (pipeline_) { pipeline_->stop(); pipeline_.reset(); }
+    if (inputInjector_) inputInjector_->releaseAllKeys();
     inputInjector_.reset();
     currentSessionId_.clear();
 }

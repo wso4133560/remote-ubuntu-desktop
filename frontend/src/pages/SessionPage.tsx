@@ -69,6 +69,7 @@ export default function SessionPage() {
   const lastStatsSampleRef = useRef<SessionStatsSample | null>(null)
   const videoRecoveryTimerRef = useRef<number | null>(null)
   const videoRecoveryAttemptsRef = useRef(0)
+  const pressedKeyCodesRef = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     let mounted = true
@@ -264,6 +265,10 @@ export default function SessionPage() {
   const cleanup = () => {
     clearSessionTimeout()
     clearVideoRecoveryTimer()
+    if (webrtcManagerRef.current && pressedKeyCodesRef.current.size > 0) {
+      webrtcManagerRef.current.releaseAllKeys()
+      pressedKeyCodesRef.current.clear()
+    }
     if (webrtcManagerRef.current) {
       webrtcManagerRef.current.close()
     }
@@ -313,13 +318,17 @@ export default function SessionPage() {
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (!connected || !webrtcManagerRef.current) return
     e.preventDefault()
-    webrtcManagerRef.current.sendKeyEvent(e.code, true)
+    if (!e.repeat) {
+      pressedKeyCodesRef.current.add(e.code)
+    }
+    webrtcManagerRef.current.sendKeyEvent(e.code, true, e.key, e.repeat, e.location)
   }
 
   const handleKeyUp = (e: React.KeyboardEvent) => {
     if (!connected || !webrtcManagerRef.current) return
     e.preventDefault()
-    webrtcManagerRef.current.sendKeyEvent(e.code, false)
+    pressedKeyCodesRef.current.delete(e.code)
+    webrtcManagerRef.current.sendKeyEvent(e.code, false, e.key, false, e.location)
   }
 
   const toggleFullscreen = async () => {
@@ -350,6 +359,29 @@ export default function SessionPage() {
       containerRef.current?.focus()
     }
   }, [connected])
+
+  useEffect(() => {
+    const releaseAll = () => {
+      if (!webrtcManagerRef.current || pressedKeyCodesRef.current.size === 0) {
+        return
+      }
+      webrtcManagerRef.current.releaseAllKeys()
+      pressedKeyCodesRef.current.clear()
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        releaseAll()
+      }
+    }
+
+    window.addEventListener('blur', releaseAll)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      window.removeEventListener('blur', releaseAll)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [])
 
   useEffect(() => {
     if (!connected) {

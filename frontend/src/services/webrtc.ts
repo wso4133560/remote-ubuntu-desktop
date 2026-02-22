@@ -154,14 +154,29 @@ export class WebRTCManager {
     }
   }
 
-  sendKeyEvent(key: string, pressed: boolean) {
+  sendKeyEvent(keyCode: string, pressed: boolean, key?: string, repeat = false, location?: number) {
     if (this.controlChannel && this.controlChannel.readyState === 'open') {
-      const message = {
+      const message: Record<string, unknown> = {
         type: 'key',
-        key_code: key,
+        key_code: keyCode,
         pressed: pressed,
       }
+      if (key !== undefined) {
+        message.key = key
+      }
+      if (repeat) {
+        message.repeat = true
+      }
+      if (location !== undefined) {
+        message.location = location
+      }
       this.controlChannel.send(JSON.stringify(message))
+    }
+  }
+
+  releaseAllKeys() {
+    if (this.controlChannel && this.controlChannel.readyState === 'open') {
+      this.controlChannel.send(JSON.stringify({ type: 'key_release_all' }))
     }
   }
 
