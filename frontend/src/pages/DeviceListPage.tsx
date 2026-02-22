@@ -48,14 +48,36 @@ export default function DeviceListPage() {
       try {
         const message = JSON.parse(event.data)
 
-        if (message.type === 'device_status_update') {
-          setDevices(prevDevices =>
-            prevDevices.map(device =>
-              device.device_id === message.device_id
-                ? { ...device, status: message.status, last_seen: message.last_seen }
-                : device
-            )
-          )
+        if (message.type === 'device_status_update' || message.type === 'status_update') {
+          const messageDeviceId = message.device_id
+          const messageStatus = message.status
+          if (!messageDeviceId || !messageStatus) return
+
+          setDevices((prevDevices) => {
+            const index = prevDevices.findIndex(d => d.device_id === messageDeviceId)
+            if (index >= 0) {
+              const next = [...prevDevices]
+              next[index] = {
+                ...next[index],
+                status: messageStatus,
+                last_seen: message.last_seen ?? next[index].last_seen,
+                device_name: message.device_name ?? next[index].device_name,
+                os_info: message.os_info ?? next[index].os_info,
+              }
+              return next
+            }
+
+            return [
+              {
+                device_id: messageDeviceId,
+                device_name: message.device_name || messageDeviceId,
+                status: messageStatus,
+                last_seen: message.last_seen || null,
+                os_info: message.os_info || null,
+              },
+              ...prevDevices,
+            ]
+          })
         }
       } catch (error) {
         console.error('Error parsing WebSocket message:', error)

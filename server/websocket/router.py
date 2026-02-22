@@ -152,6 +152,11 @@ class MessageRouter:
             await connection_manager.send_to_device(device_id, payload)
         elif sender_type == "device":
             await connection_manager.send_to_user(operator_id, payload)
+            # 当设备返回 SDP Answer，认为会话进入 ACTIVE 状态
+            if message.type == MessageType.SDP_ANSWER:
+                db = get_database()
+                async with db.session() as session:
+                    await session_manager.activate_session(session_id, session)
 
         return None
 

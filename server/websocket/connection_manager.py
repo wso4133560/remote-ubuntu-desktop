@@ -96,6 +96,30 @@ class ConnectionManager:
             return await self.send_message(connection_id, message)
         return False
 
+    async def broadcast_to_users(self, message: dict) -> None:
+        """广播消息给所有在线用户"""
+        for user_id in list(self.user_connections.keys()):
+            await self.send_to_user(user_id, message)
+
+    async def broadcast_device_status_update(
+        self,
+        device_id: str,
+        status: str,
+        last_seen: Optional[str] = None,
+        device_name: Optional[str] = None,
+        os_info: Optional[str] = None,
+    ) -> None:
+        """广播设备状态变更"""
+        message = {
+            "type": "device_status_update",
+            "device_id": device_id,
+            "status": status,
+            "last_seen": last_seen,
+            "device_name": device_name,
+            "os_info": os_info,
+        }
+        await self.broadcast_to_users(message)
+
     def get_device_connection_id(self, device_id: str) -> Optional[str]:
         """获取设备的连接 ID"""
         return self.device_connections.get(device_id)

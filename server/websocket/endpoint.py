@@ -49,6 +49,17 @@ async def websocket_endpoint(
                 device.last_seen = datetime.utcnow()
                 session.add(device)
                 await session.commit()
+                await connection_manager.broadcast_device_status_update(
+                    device_id=device.device_id,
+                    status=device.status,
+                    last_seen=(
+                        device.last_seen.isoformat()
+                        if device.last_seen
+                        else None
+                    ),
+                    device_name=device.device_name,
+                    os_info=device.os_info,
+                )
 
     heartbeat_task = None
     try:
@@ -86,3 +97,14 @@ async def websocket_endpoint(
                     device.last_seen = datetime.utcnow()
                     session.add(device)
                     await session.commit()
+                    await connection_manager.broadcast_device_status_update(
+                        device_id=device.device_id,
+                        status=device.status,
+                        last_seen=(
+                            device.last_seen.isoformat()
+                            if device.last_seen
+                            else None
+                        ),
+                        device_name=device.device_name,
+                        os_info=device.os_info,
+                    )

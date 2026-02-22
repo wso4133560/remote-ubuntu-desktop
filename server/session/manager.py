@@ -185,6 +185,7 @@ class SessionManager:
 
         session_info["state"] = SessionState.ACTIVE
 
+        updated_device = None
         async with immediate_transaction(db_session):
             result = await db_session.execute(
                 select(SessionModel).where(SessionModel.session_id == session_id)
@@ -202,6 +203,20 @@ class SessionManager:
             if device:
                 device.status = "busy"
                 db_session.add(device)
+                updated_device = device
+
+        if updated_device:
+            await connection_manager.broadcast_device_status_update(
+                device_id=updated_device.device_id,
+                status=updated_device.status,
+                last_seen=(
+                    updated_device.last_seen.isoformat()
+                    if updated_device.last_seen
+                    else None
+                ),
+                device_name=updated_device.device_name,
+                os_info=updated_device.os_info,
+            )
 
         return True, None
 
@@ -216,6 +231,7 @@ class SessionManager:
         if not session_info:
             return False, "Session not found"
 
+        updated_device = None
         async with immediate_transaction(db_session):
             result = await db_session.execute(
                 select(SessionModel).where(SessionModel.session_id == session_id)
@@ -235,6 +251,7 @@ class SessionManager:
             if device:
                 device.status = "online"
                 db_session.add(device)
+                updated_device = device
 
         message = {
             "type": MessageType.SESSION_END,
@@ -248,6 +265,19 @@ class SessionManager:
         device_id = session_info["device_id"]
         await connection_manager.send_to_user(operator_id, message)
         await connection_manager.send_to_device(device_id, message)
+
+        if updated_device:
+            await connection_manager.broadcast_device_status_update(
+                device_id=updated_device.device_id,
+                status=updated_device.status,
+                last_seen=(
+                    updated_device.last_seen.isoformat()
+                    if updated_device.last_seen
+                    else None
+                ),
+                device_name=updated_device.device_name,
+                os_info=updated_device.os_info,
+            )
 
         del self.active_sessions[session_id]
 
