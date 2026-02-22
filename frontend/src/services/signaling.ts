@@ -7,17 +7,32 @@ export class SignalingClient {
   private maxReconnectAttempts = 6
   private messageHandlers: Map<MessageType, (message: any) => void> = new Map()
   private shouldReconnect = true
+  private reconnectTimer: number | null = null
+  private connectGeneration = 0
 
   constructor(private token: string) {}
 
   connect(timeoutMs = 15000): Promise<void> {
+    this.connectGeneration++
+    const generation = this.connectGeneration
     this.shouldReconnect = true
+    if (this.reconnectTimer) {
+      window.clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    if (this.ws) {
+      this.ws.close()
+      this.ws = null
+    }
     const deadline = Date.now() + timeoutMs
 
     return new Promise((resolve, reject) => {
       let settled = false
 
       const attemptConnect = () => {
+        if (!this.shouldReconnect || generation !== this.connectGeneration) {
+          return
+        }
         const wsUrl = window.location.protocol === 'https:' ? 'wss://' : 'ws://'
         const wsHost = window.location.host
         const ws = new WebSocket(`${wsUrl}${wsHost}/ws?token=${this.token}`)
@@ -32,6 +47,10 @@ export class SignalingClient {
 
         ws.onopen = () => {
           window.clearTimeout(attemptTimeout)
+          if (generation !== this.connectGeneration) {
+            ws.close()
+            return
+          }
           opened = true
           this.reconnectAttempts = 0
           console.log('WebSocket connected')
@@ -47,11 +66,14 @@ export class SignalingClient {
 
         ws.onclose = () => {
           window.clearTimeout(attemptTimeout)
+          if (this.ws === ws) {
+            this.ws = null
+          }
 
           if (opened) {
             console.log('WebSocket closed')
-            if (this.shouldReconnect) {
-              this.handleReconnect()
+            if (this.shouldReconnect && generation === this.connectGeneration) {
+              this.handleReconnect(generation)
             }
             return
           }
@@ -64,10 +86,17 @@ export class SignalingClient {
             return
           }
 
+          if (!this.shouldReconnect || generation !== this.connectGeneration) {
+            return
+          }
+
           const delay = Math.min(Math.pow(2, this.reconnectAttempts) * 500, 2000)
           this.reconnectAttempts++
           console.warn(`WebSocket connect attempt failed, retrying in ${delay}ms...`)
-          window.setTimeout(attemptConnect, delay)
+          this.reconnectTimer = window.setTimeout(() => {
+            this.reconnectTimer = null
+            attemptConnect()
+          }, delay)
         }
 
         ws.onmessage = (event) => {
@@ -85,7 +114,12 @@ export class SignalingClient {
   }
 
   disconnect() {
+    this.connectGeneration++
     this.shouldReconnect = false
+    if (this.reconnectTimer) {
+      window.clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
     if (this.ws) {
       this.ws.close()
       this.ws = null
@@ -162,7 +196,7 @@ export class SignalingClient {
     }
   }
 
-  private handleReconnect() {
+  private handleReconnect(generation: number) {
     if (!this.shouldReconnect) {
       return
     }
@@ -176,7 +210,11 @@ export class SignalingClient {
     const delay = Math.min(Math.pow(2, this.reconnectAttempts) * 1000, 32000)
     console.log(`Reconnecting in ${delay}ms...`)
 
-    setTimeout(() => {
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null
+      if (!this.shouldReconnect || generation !== this.connectGeneration) {
+        return
+      }
       this.connect().catch(console.error)
     }, delay)
   }

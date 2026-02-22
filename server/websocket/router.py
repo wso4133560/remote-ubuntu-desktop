@@ -19,7 +19,7 @@ class MessageRouter:
         self.session_routes: Dict[str, tuple[str, str]] = {}
 
     async def route_message(
-        self, message: dict, sender_id: str, sender_type: str
+        self, message: dict, sender_id: str, sender_type: str, sender_connection_id: str
     ) -> Optional[dict]:
         """路由消息"""
         print(f"[DEBUG] route_message: type={message.get('type')}, sender={sender_id}, sender_type={sender_type}", flush=True)
@@ -37,7 +37,9 @@ class MessageRouter:
 
             elif msg_type == MessageType.SESSION_REQUEST:
                 print(f"[DEBUG] Routing to _route_session_request", flush=True)
-                return await self._route_session_request(validated_msg, sender_id)
+                return await self._route_session_request(
+                    validated_msg, sender_id, sender_connection_id
+                )
 
             elif msg_type in [
                 MessageType.SESSION_ACCEPT,
@@ -50,10 +52,14 @@ class MessageRouter:
                 MessageType.SDP_ANSWER,
                 MessageType.ICE_CANDIDATE,
             ]:
-                return await self._route_webrtc_message(validated_msg, sender_id, sender_type)
+                return await self._route_webrtc_message(
+                    validated_msg, sender_id, sender_type, sender_connection_id
+                )
 
             elif msg_type == MessageType.SESSION_END:
-                return await self._route_session_end(validated_msg, sender_id)
+                return await self._route_session_end(
+                    validated_msg, sender_id, sender_type, sender_connection_id
+                )
 
             elif msg_type == MessageType.METRICS_UPDATE:
                 return await self._handle_metrics(validated_msg)
@@ -81,7 +87,9 @@ class MessageRouter:
             "timestamp": datetime.utcnow().timestamp(),
         }
 
-    async def _route_session_request(self, message, operator_id: str) -> Optional[dict]:
+    async def _route_session_request(
+        self, message, operator_id: str, operator_connection_id: str
+    ) -> Optional[dict]:
         """路由会话请求"""
         device_id = message.device_id
         session_id = message.session_id
@@ -90,7 +98,7 @@ class MessageRouter:
         db = get_database()
         async with db.session() as session:
             success, new_session_id, error = await session_manager.create_session_request(
-                device_id, operator_id, session
+                device_id, operator_id, session_id, operator_connection_id, session
             )
             print(f"[DEBUG] create_session_request result: success={success}, error={error}", flush=True)
 
@@ -128,7 +136,7 @@ class MessageRouter:
         return None
 
     async def _route_webrtc_message(
-        self, message, sender_id: str, sender_type: str
+        self, message, sender_id: str, sender_type: str, sender_connection_id: str
     ) -> Optional[dict]:
         """路由 WebRTC 消息"""
         session_id = message.session_id
@@ -145,13 +153,22 @@ class MessageRouter:
 
         operator_id = session_info["operator_id"]
         device_id = session_info["device_id"]
+        operator_conn_id = session_info.get("operator_connection_id")
         # validate_message() 返回的是 Pydantic 模型，发送前需转为可 JSON 序列化的 dict
         payload = message.model_dump(mode="json") if hasattr(message, "model_dump") else message
 
         if sender_type == "user":
+            if operator_conn_id and sender_connection_id != operator_conn_id:
+                return self._create_error_message(
+                    ErrorCode.SESSION_NOT_FOUND,
+                    "Session does not belong to this connection",
+                )
             await connection_manager.send_to_device(device_id, payload)
         elif sender_type == "device":
-            await connection_manager.send_to_user(operator_id, payload)
+            if operator_conn_id:
+                await connection_manager.send_message(operator_conn_id, payload)
+            else:
+                await connection_manager.send_to_user(operator_id, payload)
             # 当设备返回 SDP Answer，认为会话进入 ACTIVE 状态
             if message.type == MessageType.SDP_ANSWER:
                 db = get_database()
@@ -160,10 +177,21 @@ class MessageRouter:
 
         return None
 
-    async def _route_session_end(self, message, sender_id: str) -> Optional[dict]:
+    async def _route_session_end(
+        self, message, sender_id: str, sender_type: str, sender_connection_id: str
+    ) -> Optional[dict]:
         """路由会话结束"""
         session_id = message.session_id
         reason = getattr(message, "reason", None)
+        session_info = session_manager.active_sessions.get(session_id)
+
+        if sender_type == "user" and session_info:
+            operator_conn_id = session_info.get("operator_connection_id")
+            if operator_conn_id and sender_connection_id != operator_conn_id:
+                return self._create_error_message(
+                    ErrorCode.SESSION_NOT_FOUND,
+                    "Session does not belong to this connection",
+                )
 
         db = get_database()
         async with db.session() as session:

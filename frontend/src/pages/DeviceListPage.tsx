@@ -20,19 +20,34 @@ export default function DeviceListPage() {
   const { logout } = useAuth()
   const navigate = useNavigate()
   const wsRef = useRef<WebSocket | null>(null)
+  const reconnectTimerRef = useRef<number | null>(null)
+  const shouldReconnectRef = useRef(true)
 
   useEffect(() => {
+    shouldReconnectRef.current = true
     loadDevices()
     connectWebSocket()
 
     return () => {
+      shouldReconnectRef.current = false
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
       if (wsRef.current) {
         wsRef.current.close()
+        wsRef.current = null
       }
     }
   }, [])
 
   const connectWebSocket = () => {
+    if (!shouldReconnectRef.current) return
+
+    if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
+      return
+    }
+
     const token = localStorage.getItem('access_token')
     if (!token) return
 
@@ -88,9 +103,26 @@ export default function DeviceListPage() {
       console.error('WebSocket error:', error)
     }
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      if (wsRef.current === ws) {
+        wsRef.current = null
+      }
+
+      if (!shouldReconnectRef.current) {
+        return
+      }
+
+      // Token invalid/expired: stop reconnect storm and let user re-login.
+      if (event.code === 1008) {
+        console.warn('Device status WebSocket closed with 1008 (auth), skip reconnect')
+        return
+      }
+
       console.log('WebSocket disconnected, reconnecting in 5s...')
-      setTimeout(connectWebSocket, 5000)
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null
+        connectWebSocket()
+      }, 5000)
     }
   }
 

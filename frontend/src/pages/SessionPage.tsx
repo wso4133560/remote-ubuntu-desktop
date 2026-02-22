@@ -104,6 +104,10 @@ export default function SessionPage() {
       signalingClientRef.current = signalingClient
 
       signalingClient.on(MessageType.SESSION_ACCEPT, async (message) => {
+        if (!message.session_id || message.session_id !== sessionIdRef.current) {
+          console.warn('Ignoring session_accept for another session:', message.session_id)
+          return
+        }
         if (sessionAcceptedRef.current) {
           console.warn('Ignoring duplicate session_accept:', message.session_id)
           return
@@ -111,23 +115,24 @@ export default function SessionPage() {
         sessionAcceptedRef.current = true
         console.log('Session accepted:', message)
         clearSessionTimeout()
-        // 使用服务器返回的 session_id
-        if (message.session_id) {
-          sessionIdRef.current = message.session_id
-          console.log('Updated session_id to:', message.session_id)
-        }
         setError('')
         await startWebRTC()
       })
 
       signalingClient.on(MessageType.SESSION_REJECT, (message) => {
+        if (message.session_id && message.session_id !== sessionIdRef.current) {
+          return
+        }
         console.log('Session rejected:', message.reason)
         clearSessionTimeout()
         setConnectionState('failed')
         setError(`Session rejected: ${message.reason}`)
       })
 
-      signalingClient.on(MessageType.SESSION_END, () => {
+      signalingClient.on(MessageType.SESSION_END, (message: any) => {
+        if (message?.session_id && message.session_id !== sessionIdRef.current) {
+          return
+        }
         clearSessionTimeout()
         setConnectionState('ended')
         setError('Session ended by remote')
@@ -259,14 +264,16 @@ export default function SessionPage() {
   const cleanup = () => {
     clearSessionTimeout()
     clearVideoRecoveryTimer()
-    sessionAcceptedRef.current = false
     if (webrtcManagerRef.current) {
       webrtcManagerRef.current.close()
     }
     if (signalingClientRef.current) {
-      signalingClientRef.current.sendSessionEnd(sessionIdRef.current)
+      if (sessionAcceptedRef.current && sessionIdRef.current) {
+        signalingClientRef.current.sendSessionEnd(sessionIdRef.current)
+      }
       signalingClientRef.current.disconnect()
     }
+    sessionAcceptedRef.current = false
   }
 
   const handleDisconnect = () => {

@@ -26,6 +26,8 @@ class SessionManager:
         self,
         device_id: str,
         operator_id: str,
+        requested_session_id: Optional[str],
+        operator_connection_id: Optional[str],
         session: AsyncSession,
     ) -> tuple[bool, Optional[str], Optional[str]]:
         """创建会话请求"""
@@ -43,7 +45,7 @@ class SessionManager:
         if device.status == "offline":
             return False, None, "Device is offline"
 
-        session_id = secrets.token_urlsafe(16)
+        session_id = requested_session_id or secrets.token_urlsafe(16)
 
         async with immediate_transaction(session):
             db_session = SessionModel(
@@ -58,6 +60,7 @@ class SessionManager:
             "session_id": session_id,
             "device_id": device_id,
             "operator_id": operator_id,
+            "operator_connection_id": operator_connection_id,
             "state": SessionState.PENDING,
             "created_at": datetime.utcnow(),
         }
@@ -127,8 +130,12 @@ class SessionManager:
             "session_id": session_id,
         }
 
-        operator_id = session_info["operator_id"]
-        await connection_manager.send_to_user(operator_id, message)
+        operator_conn_id = session_info.get("operator_connection_id")
+        if operator_conn_id:
+            await connection_manager.send_message(operator_conn_id, message)
+        else:
+            operator_id = session_info["operator_id"]
+            await connection_manager.send_to_user(operator_id, message)
 
         return True, None
 
@@ -166,8 +173,12 @@ class SessionManager:
             "reason": reason,
         }
 
-        operator_id = session_info["operator_id"]
-        await connection_manager.send_to_user(operator_id, message)
+        operator_conn_id = session_info.get("operator_connection_id")
+        if operator_conn_id:
+            await connection_manager.send_message(operator_conn_id, message)
+        else:
+            operator_id = session_info["operator_id"]
+            await connection_manager.send_to_user(operator_id, message)
 
         del self.active_sessions[session_id]
 
@@ -262,8 +273,12 @@ class SessionManager:
         }
 
         operator_id = session_info["operator_id"]
+        operator_conn_id = session_info.get("operator_connection_id")
         device_id = session_info["device_id"]
-        await connection_manager.send_to_user(operator_id, message)
+        if operator_conn_id:
+            await connection_manager.send_message(operator_conn_id, message)
+        else:
+            await connection_manager.send_to_user(operator_id, message)
         await connection_manager.send_to_device(device_id, message)
 
         if updated_device:

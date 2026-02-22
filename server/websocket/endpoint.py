@@ -9,6 +9,7 @@ from .router import message_router
 from ..models.models import Device, Session as SessionModel
 from ..database.database import get_database
 from ..protocol.states import SessionState
+from ..session.manager import session_manager
 
 router = APIRouter()
 
@@ -90,7 +91,9 @@ async def websocket_endpoint(
 
         while True:
             data = await websocket.receive_json()
-            response = await message_router.route_message(data, client_id, client_type)
+            response = await message_router.route_message(
+                data, client_id, client_type, connection_id
+            )
             if response:
                 await websocket.send_json(response)
 
@@ -101,6 +104,32 @@ async def websocket_endpoint(
     finally:
         if heartbeat_task:
             heartbeat_task.cancel()
+
+        # If an operator/device socket drops unexpectedly, close related active sessions
+        # so the device does not remain permanently busy.
+        stale_session_ids = []
+        if client_type == "user":
+            stale_session_ids = [
+                sid for sid, info in session_manager.active_sessions.items()
+                if info.get("operator_connection_id") == connection_id
+            ]
+        elif client_type == "device":
+            stale_session_ids = [
+                sid for sid, info in session_manager.active_sessions.items()
+                if info.get("device_id") == client_id
+            ]
+
+        if stale_session_ids:
+            db = get_database()
+            async with db.session() as session:
+                reason = (
+                    "operator_disconnected"
+                    if client_type == "user"
+                    else "device_disconnected"
+                )
+                for sid in stale_session_ids:
+                    await session_manager.end_session(sid, reason, session)
+
         connection_manager.disconnect(connection_id)
 
         # 设备断开连接时更新状态为 offline
