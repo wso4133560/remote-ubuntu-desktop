@@ -1,8 +1,11 @@
 """桌面视频捕获（Wayland 检测 + X11 回退）"""
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import fractions
 import os
 import shutil
 import subprocess
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
@@ -10,6 +13,7 @@ from typing import Optional
 
 import numpy as np
 from aiortc import VideoStreamTrack
+from aiortc.mediastreams import MediaStreamError, VIDEO_CLOCK_RATE
 from av import VideoFrame
 
 try:
@@ -23,6 +27,11 @@ try:
     from Xlib import display as XDisplay
 except Exception:
     XDisplay = None
+
+try:
+    from mss import mss as MSS
+except Exception:
+    MSS = None
 
 
 class WaylandCapture:
@@ -127,7 +136,7 @@ class WaylandVideoTrack(VideoStreamTrack):
         super().__init__()
         self.width = width
         self.height = height
-        self.fps = fps
+        self.fps = max(5, int(fps))
         self.capture = WaylandCapture()
         self.initialized = False
         self.backend = "test-pattern"
@@ -138,6 +147,15 @@ class WaylandVideoTrack(VideoStreamTrack):
         self._x11_pointer_display = None
         self._x11_screen_width = 1
         self._x11_screen_height = 1
+        self._latest_frame: Optional[np.ndarray] = None
+        self._capture_task: Optional[asyncio.Task] = None
+        self._capture_executor: Optional[ThreadPoolExecutor] = None
+        self._frame_interval = 1.0 / self.fps
+        self._timestamp: Optional[int] = None
+        self._start_time: Optional[float] = None
+        self._mss_instance = None
+        self._mss_monitor = None
+        self._mss_owner_thread_id: Optional[int] = None
 
     async def initialize(self):
         """初始化捕获"""
@@ -152,38 +170,99 @@ class WaylandVideoTrack(VideoStreamTrack):
         print(f"Video capture backend: {self.backend}")
         if not self.initialized:
             print("Warning: desktop capture not available, using test pattern")
+            return
+
+        self._capture_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="screen-capture")
+        self._capture_task = asyncio.create_task(self._capture_loop())
 
     async def recv(self):
         """接收视频帧"""
-        pts, time_base = await self.next_timestamp()
+        pts, time_base = await self._next_frame_timestamp()
 
-        frame_data = None
-        try:
-            if self.backend == "x11-imagegrab":
-                frame_data = self._capture_with_imagegrab()
-            elif self.backend == "x11-import":
-                frame_data = self._capture_with_import()
-        except Exception as e:
-            now = time.time()
-            if now - self._last_capture_error_at > 5:
-                print(f"Screen capture failed on backend={self.backend}: {e}")
-                self._last_capture_error_at = now
-
+        frame_data = self._latest_frame
         if frame_data is None:
             frame_data = self._generate_test_pattern_frame()
-        elif self.backend.startswith("x11-"):
-            self._overlay_x11_cursor(frame_data)
 
         frame = VideoFrame.from_ndarray(frame_data, format="rgb24")
         frame.pts = pts
         frame.time_base = time_base
         return frame
 
+    async def _capture_loop(self):
+        loop = asyncio.get_running_loop()
+        try:
+            while self.readyState == "live":
+                loop_started = time.perf_counter()
+                frame_data = None
+
+                try:
+                    if self.backend == "x11-mss":
+                        frame_data = await loop.run_in_executor(
+                            self._capture_executor,
+                            self._capture_with_mss,
+                        )
+                    elif self.backend == "x11-imagegrab":
+                        frame_data = await loop.run_in_executor(
+                            self._capture_executor,
+                            self._capture_with_imagegrab,
+                        )
+                    elif self.backend == "x11-import":
+                        frame_data = await loop.run_in_executor(
+                            self._capture_executor,
+                            self._capture_with_import,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    now = time.time()
+                    if now - self._last_capture_error_at > 5:
+                        print(f"Screen capture failed on backend={self.backend}: {e}")
+                        self._last_capture_error_at = now
+
+                if frame_data is not None:
+                    if self.backend.startswith("x11-"):
+                        self._overlay_x11_cursor(frame_data)
+                    self._latest_frame = frame_data
+
+                elapsed = time.perf_counter() - loop_started
+                sleep_time = self._frame_interval - elapsed
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+        finally:
+            if self._capture_executor is not None:
+                try:
+                    await loop.run_in_executor(self._capture_executor, self._close_mss_instance)
+                except Exception:
+                    pass
+
+    async def _next_frame_timestamp(self):
+        if self.readyState != "live":
+            raise MediaStreamError
+
+        frame_step = int((1 / self.fps) * VIDEO_CLOCK_RATE)
+        if self._timestamp is None:
+            self._start_time = time.time()
+            self._timestamp = 0
+        else:
+            self._timestamp += frame_step
+            wait = self._start_time + (self._timestamp / VIDEO_CLOCK_RATE) - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+        return self._timestamp, fractions.Fraction(1, VIDEO_CLOCK_RATE)
+
     def _select_capture_backend(self) -> str:
         context = self._find_x11_context()
         if context:
             self.display, self.xauthority = context
             self._apply_x11_env()
+
+            if MSS is not None:
+                try:
+                    self._probe_mss_backend()
+                    return "x11-mss"
+                except Exception as e:
+                    print(f"MSS backend unavailable: {e}")
 
             if ImageGrab is not None:
                 try:
@@ -349,9 +428,63 @@ class WaylandVideoTrack(VideoStreamTrack):
         image = ImageGrab.grab()
         return self._resize_rgb(image)
 
+    def _capture_with_mss(self) -> np.ndarray:
+        if MSS is None:
+            raise RuntimeError("mss is not available")
+        self._apply_x11_env()
+        thread_id = threading.get_ident()
+        if self._mss_instance is None or self._mss_owner_thread_id != thread_id:
+            self._close_mss_instance()
+            self._mss_instance = MSS()
+            if not self._mss_instance.monitors:
+                raise RuntimeError("No monitor found for mss capture")
+            self._mss_monitor = self._mss_instance.monitors[0]
+            self._mss_owner_thread_id = thread_id
+
+        raw = self._mss_instance.grab(self._mss_monitor)
+        frame_bgra = np.asarray(raw, dtype=np.uint8)
+        frame_rgb = np.ascontiguousarray(frame_bgra[:, :, :3][:, :, ::-1])
+
+        if frame_rgb.shape[1] == self.width and frame_rgb.shape[0] == self.height:
+            return frame_rgb
+
+        if Image is None:
+            return frame_rgb
+
+        image = Image.fromarray(frame_rgb, mode="RGB")
+        return self._resize_rgb(image)
+
+    def _probe_mss_backend(self):
+        if MSS is None:
+            raise RuntimeError("mss is not available")
+        self._apply_x11_env()
+        with MSS() as mss:
+            if not mss.monitors:
+                raise RuntimeError("No monitor found for mss capture")
+            mss.grab(mss.monitors[0])
+
+    def _close_mss_instance(self):
+        if self._mss_instance is not None:
+            try:
+                self._mss_instance.close()
+            except Exception:
+                pass
+            self._mss_instance = None
+            self._mss_monitor = None
+            self._mss_owner_thread_id = None
+
     def _capture_with_import(self) -> np.ndarray:
         self._apply_x11_env()
-        cmd = ["import", "-window", "root", "png:-"]
+        cmd = [
+            "import",
+            "-window",
+            "root",
+            "-resize",
+            f"{self.width}x{self.height}!",
+            "-depth",
+            "8",
+            "rgb:-",
+        ]
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -362,13 +495,23 @@ class WaylandVideoTrack(VideoStreamTrack):
         if result.returncode != 0:
             stderr_text = result.stderr.decode("utf-8", errors="ignore")
             raise RuntimeError(stderr_text.strip() or f"import exited with code {result.returncode}")
-        if Image is None:
-            raise RuntimeError("Pillow Image is not available")
-        try:
-            image = Image.open(BytesIO(result.stdout))
-        except (UnidentifiedImageError, OSError) as e:
-            raise RuntimeError(f"cannot decode screenshot: {e}") from e
-        return self._resize_rgb(image)
+
+        expected_size = self.width * self.height * 3
+        if len(result.stdout) != expected_size:
+            if Image is None:
+                raise RuntimeError(
+                    f"unexpected raw frame size {len(result.stdout)}, expected {expected_size}"
+                )
+            try:
+                image = Image.open(BytesIO(result.stdout))
+            except (UnidentifiedImageError, OSError) as e:
+                raise RuntimeError(f"cannot decode screenshot: {e}") from e
+            return self._resize_rgb(image)
+
+        frame_data = np.frombuffer(result.stdout, dtype=np.uint8).reshape(
+            (self.height, self.width, 3)
+        )
+        return np.ascontiguousarray(frame_data)
 
     def _generate_test_pattern_frame(self) -> np.ndarray:
         """生成测试帧（仅在无法访问真实桌面时使用）"""
@@ -379,3 +522,24 @@ class WaylandVideoTrack(VideoStreamTrack):
         frame_data[:, offset:offset + bar_width] = [65, 110, 185]
         self._frame_count += 1
         return frame_data
+
+    def stop(self):
+        if self._capture_task:
+            self._capture_task.cancel()
+            self._capture_task = None
+
+        if self._x11_pointer_display is not None:
+            try:
+                self._x11_pointer_display.close()
+            except Exception:
+                pass
+            self._x11_pointer_display = None
+
+        if self._mss_instance is not None:
+            self._close_mss_instance()
+
+        if self._capture_executor is not None:
+            self._capture_executor.shutdown(wait=False, cancel_futures=True)
+            self._capture_executor = None
+
+        super().stop()

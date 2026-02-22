@@ -5,6 +5,43 @@ import { WebRTCManager } from '../services/webrtc'
 import { MessageType } from '../protocol/messageTypes'
 import { FileTransfer } from '../components/FileTransfer'
 
+interface SessionStats {
+  fps: number
+  downloadMbps: number
+  uploadMbps: number
+  packetLossPercent: number | null
+  roundTripTimeMs: number | null
+}
+
+interface SessionStatsSample {
+  timestamp: number
+  frameCount: number | null
+  bytesReceived: number
+  bytesSent: number
+  packetsReceived: number
+  packetsLost: number
+}
+
+const getRenderedFrameCount = (video: HTMLVideoElement): number | null => {
+  if (typeof video.getVideoPlaybackQuality === 'function') {
+    return video.getVideoPlaybackQuality().totalVideoFrames
+  }
+
+  const webkitVideo = video as HTMLVideoElement & { webkitDecodedFrameCount?: number }
+  if (typeof webkitVideo.webkitDecodedFrameCount === 'number') {
+    return webkitVideo.webkitDecodedFrameCount
+  }
+
+  return null
+}
+
+const formatStat = (value: number | null, digits = 1, unit = ''): string => {
+  if (value == null || !Number.isFinite(value)) {
+    return '--'
+  }
+  return `${value.toFixed(digits)}${unit}`
+}
+
 export default function SessionPage() {
   const { deviceId } = useParams<{ deviceId: string }>()
   const navigate = useNavigate()
@@ -14,12 +51,21 @@ export default function SessionPage() {
   const [connectionState, setConnectionState] = useState('connecting')
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [showFileTransfer, setShowFileTransfer] = useState(false)
+  const [showStats, setShowStats] = useState(true)
+  const [sessionStats, setSessionStats] = useState<SessionStats>({
+    fps: 0,
+    downloadMbps: 0,
+    uploadMbps: 0,
+    packetLossPercent: null,
+    roundTripTimeMs: null
+  })
 
   const signalingClientRef = useRef<SignalingClient | null>(null)
   const webrtcManagerRef = useRef<WebRTCManager | null>(null)
   const sessionIdRef = useRef<string>('')
   const containerRef = useRef<HTMLDivElement>(null)
   const sessionTimeoutRef = useRef<number | null>(null)
+  const lastStatsSampleRef = useRef<SessionStatsSample | null>(null)
 
   useEffect(() => {
     let mounted = true
@@ -223,6 +269,100 @@ export default function SessionPage() {
     }
   }, [connected])
 
+  useEffect(() => {
+    if (!connected) {
+      lastStatsSampleRef.current = null
+      setSessionStats({
+        fps: 0,
+        downloadMbps: 0,
+        uploadMbps: 0,
+        packetLossPercent: null,
+        roundTripTimeMs: null
+      })
+      return
+    }
+
+    const interval = window.setInterval(() => {
+      void (async () => {
+        try {
+          const webrtcManager = webrtcManagerRef.current
+          const video = videoRef.current
+          if (!webrtcManager || !video) {
+            return
+          }
+
+          const snapshot = await webrtcManager.getPerformanceSnapshot()
+          if (!snapshot) {
+            return
+          }
+
+          const now = performance.now()
+          const frameCount = getRenderedFrameCount(video)
+          const previousSample = lastStatsSampleRef.current
+
+          if (!previousSample) {
+            lastStatsSampleRef.current = {
+              timestamp: now,
+              frameCount,
+              bytesReceived: snapshot.bytesReceived,
+              bytesSent: snapshot.bytesSent,
+              packetsReceived: snapshot.packetsReceived,
+              packetsLost: snapshot.packetsLost
+            }
+            setSessionStats((current) => ({
+              ...current,
+              roundTripTimeMs: snapshot.roundTripTimeMs ?? current.roundTripTimeMs
+            }))
+            return
+          }
+
+          const elapsedSeconds = (now - previousSample.timestamp) / 1000
+          if (elapsedSeconds <= 0) {
+            return
+          }
+
+          const receivedBytesDelta = Math.max(0, snapshot.bytesReceived - previousSample.bytesReceived)
+          const sentBytesDelta = Math.max(0, snapshot.bytesSent - previousSample.bytesSent)
+          const packetsReceivedDelta = Math.max(0, snapshot.packetsReceived - previousSample.packetsReceived)
+          const packetsLostDelta = Math.max(0, snapshot.packetsLost - previousSample.packetsLost)
+
+          const calculatedFps = frameCount != null && previousSample.frameCount != null
+            ? Math.max(0, (frameCount - previousSample.frameCount) / elapsedSeconds)
+            : null
+
+          let packetLossPercent: number | null = null
+          const totalPacketsDelta = packetsReceivedDelta + packetsLostDelta
+          if (totalPacketsDelta > 0) {
+            packetLossPercent = (packetsLostDelta / totalPacketsDelta) * 100
+          }
+
+          setSessionStats((current) => ({
+            fps: calculatedFps ?? current.fps,
+            downloadMbps: (receivedBytesDelta * 8) / (elapsedSeconds * 1_000_000),
+            uploadMbps: (sentBytesDelta * 8) / (elapsedSeconds * 1_000_000),
+            packetLossPercent: packetLossPercent ?? current.packetLossPercent,
+            roundTripTimeMs: snapshot.roundTripTimeMs ?? current.roundTripTimeMs
+          }))
+
+          lastStatsSampleRef.current = {
+            timestamp: now,
+            frameCount,
+            bytesReceived: snapshot.bytesReceived,
+            bytesSent: snapshot.bytesSent,
+            packetsReceived: snapshot.packetsReceived,
+            packetsLost: snapshot.packetsLost
+          }
+        } catch (statsError) {
+          console.error('Failed to collect WebRTC stats:', statsError)
+        }
+      })()
+    }, 1000)
+
+    return () => {
+      window.clearInterval(interval)
+    }
+  }, [connected])
+
   return (
     <div
       ref={containerRef}
@@ -234,6 +374,13 @@ export default function SessionPage() {
       <header style={{ background: '#1a1a1a', padding: '1rem 2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h2 style={{ color: 'white', margin: 0 }}>Remote Session - {deviceId}</h2>
         <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <button
+            onClick={() => setShowStats(!showStats)}
+            style={{ padding: '0.5rem 1rem', background: '#1f6feb', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
+            disabled={!connected}
+          >
+            {showStats ? 'Hide Stats' : 'Show Stats'}
+          </button>
           <button
             onClick={() => setShowFileTransfer(!showFileTransfer)}
             style={{ padding: '0.5rem 1rem', background: '#17a2b8', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
@@ -280,6 +427,48 @@ export default function SessionPage() {
             {!connected && (
               <div style={{ position: 'absolute', color: '#ddd', fontSize: '1.05rem' }}>
                 Connecting... ({connectionState})
+              </div>
+            )}
+            {connected && showStats && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '1rem',
+                  right: '1rem',
+                  minWidth: '260px',
+                  background: 'rgba(15, 23, 42, 0.86)',
+                  border: '1px solid rgba(148, 163, 184, 0.4)',
+                  borderRadius: '10px',
+                  padding: '0.85rem',
+                  color: '#e2e8f0',
+                  backdropFilter: 'blur(4px)'
+                }}
+              >
+                <div style={{ fontSize: '0.78rem', letterSpacing: '0.06em', textTransform: 'uppercase', color: '#94a3b8', marginBottom: '0.6rem' }}>
+                  实时传输统计
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.6rem 1rem' }}>
+                  <div>
+                    <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>帧率</div>
+                    <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>{formatStat(sessionStats.fps, 1, ' FPS')}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>延迟</div>
+                    <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>{formatStat(sessionStats.roundTripTimeMs, 0, ' ms')}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>下载速度</div>
+                    <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>{formatStat(sessionStats.downloadMbps, 2, ' Mbps')}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>上传速度</div>
+                    <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>{formatStat(sessionStats.uploadMbps, 2, ' Mbps')}</div>
+                  </div>
+                  <div style={{ gridColumn: '1 / span 2' }}>
+                    <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>丢包率</div>
+                    <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>{formatStat(sessionStats.packetLossPercent, 2, '%')}</div>
+                  </div>
+                </div>
               </div>
             )}
           </div>

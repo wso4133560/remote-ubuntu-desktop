@@ -1,6 +1,31 @@
 import { SignalingClient } from './signaling'
 import { MessageType } from '../protocol/messageTypes'
 
+interface ExtendedIceCandidatePairStats extends RTCIceCandidatePairStats {
+  selected?: boolean
+}
+
+export interface WebRTCPerformanceSnapshot {
+  timestamp: number
+  bytesReceived: number
+  bytesSent: number
+  packetsReceived: number
+  packetsLost: number
+  roundTripTimeMs: number | null
+}
+
+const isInboundVideoStats = (stat: RTCStats): stat is RTCInboundRtpStreamStats => {
+  return stat.type === 'inbound-rtp' && (stat as RTCInboundRtpStreamStats).kind === 'video'
+}
+
+const isOutboundVideoStats = (stat: RTCStats): stat is RTCOutboundRtpStreamStats => {
+  return stat.type === 'outbound-rtp' && (stat as RTCOutboundRtpStreamStats).kind === 'video'
+}
+
+const isSuccessfulCandidatePair = (stat: RTCStats): stat is ExtendedIceCandidatePairStats => {
+  return stat.type === 'candidate-pair' && (stat as RTCIceCandidatePairStats).state === 'succeeded'
+}
+
 export class WebRTCManager {
   private peerConnection: RTCPeerConnection | null = null
   private signalingClient: SignalingClient
@@ -210,5 +235,55 @@ export class WebRTCManager {
 
   getConnectionState(): RTCPeerConnectionState | null {
     return this.peerConnection?.connectionState || null
+  }
+
+  async getPerformanceSnapshot(): Promise<WebRTCPerformanceSnapshot | null> {
+    if (!this.peerConnection) {
+      return null
+    }
+
+    const report = await this.peerConnection.getStats()
+    let inboundVideoStats: RTCInboundRtpStreamStats | null = null
+    let outboundVideoStats: RTCOutboundRtpStreamStats | null = null
+    let candidatePairStats: ExtendedIceCandidatePairStats | null = null
+
+    for (const stat of report.values()) {
+      if (isInboundVideoStats(stat)) {
+        if (!inboundVideoStats || (stat.bytesReceived ?? 0) > (inboundVideoStats.bytesReceived ?? 0)) {
+          inboundVideoStats = stat
+        }
+        continue
+      }
+
+      if (isOutboundVideoStats(stat)) {
+        if (!outboundVideoStats || (stat.bytesSent ?? 0) > (outboundVideoStats.bytesSent ?? 0)) {
+          outboundVideoStats = stat
+        }
+        continue
+      }
+
+      if (isSuccessfulCandidatePair(stat)) {
+        if (!candidatePairStats || stat.nominated || stat.selected) {
+          candidatePairStats = stat
+        }
+      }
+    }
+
+    const bytesReceived = candidatePairStats?.bytesReceived ?? inboundVideoStats?.bytesReceived ?? 0
+    const bytesSent = candidatePairStats?.bytesSent ?? outboundVideoStats?.bytesSent ?? 0
+    const packetsReceived = inboundVideoStats?.packetsReceived ?? 0
+    const packetsLost = inboundVideoStats?.packetsLost ?? 0
+    const roundTripTimeMs = candidatePairStats?.currentRoundTripTime != null
+      ? candidatePairStats.currentRoundTripTime * 1000
+      : null
+
+    return {
+      timestamp: performance.now(),
+      bytesReceived,
+      bytesSent,
+      packetsReceived,
+      packetsLost,
+      roundTripTimeMs
+    }
   }
 }
