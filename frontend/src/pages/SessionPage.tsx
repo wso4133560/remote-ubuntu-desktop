@@ -63,9 +63,12 @@ export default function SessionPage() {
   const signalingClientRef = useRef<SignalingClient | null>(null)
   const webrtcManagerRef = useRef<WebRTCManager | null>(null)
   const sessionIdRef = useRef<string>('')
+  const sessionAcceptedRef = useRef(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const sessionTimeoutRef = useRef<number | null>(null)
   const lastStatsSampleRef = useRef<SessionStatsSample | null>(null)
+  const videoRecoveryTimerRef = useRef<number | null>(null)
+  const videoRecoveryAttemptsRef = useRef(0)
 
   useEffect(() => {
     let mounted = true
@@ -95,11 +98,17 @@ export default function SessionPage() {
       }
 
       sessionIdRef.current = Math.random().toString(36).substring(2, 15)
+      sessionAcceptedRef.current = false
 
       const signalingClient = new SignalingClient(token)
       signalingClientRef.current = signalingClient
 
       signalingClient.on(MessageType.SESSION_ACCEPT, async (message) => {
+        if (sessionAcceptedRef.current) {
+          console.warn('Ignoring duplicate session_accept:', message.session_id)
+          return
+        }
+        sessionAcceptedRef.current = true
         console.log('Session accepted:', message)
         clearSessionTimeout()
         // 使用服务器返回的 session_id
@@ -151,8 +160,25 @@ export default function SessionPage() {
     }
   }
 
-  const startWebRTC = async () => {
+  const clearVideoRecoveryTimer = () => {
+    if (videoRecoveryTimerRef.current) {
+      window.clearTimeout(videoRecoveryTimerRef.current)
+      videoRecoveryTimerRef.current = null
+    }
+  }
+
+  const startWebRTC = async (isRecovery = false) => {
     try {
+      if (!isRecovery && webrtcManagerRef.current) {
+        console.warn('WebRTC already initialized, skipping duplicate start')
+        return
+      }
+
+      clearVideoRecoveryTimer()
+      if (!isRecovery) {
+        videoRecoveryAttemptsRef.current = 0
+      }
+
       const webrtcManager = new WebRTCManager(
         signalingClientRef.current!,
         sessionIdRef.current
@@ -161,7 +187,28 @@ export default function SessionPage() {
 
       await webrtcManager.initialize((stream) => {
         if (videoRef.current) {
-          videoRef.current.srcObject = stream
+          const videoEl = videoRef.current
+          videoEl.srcObject = stream
+          // Ensure autoplay works reliably across browsers/policies.
+          videoEl.muted = true
+          void videoEl.play().catch((err) => {
+            console.warn('Initial video.play() failed, retrying on metadata:', err)
+          })
+          videoEl.onloadedmetadata = () => {
+            void videoEl.play().catch((err) => {
+              console.warn('video.play() on loadedmetadata failed:', err)
+            })
+            if (videoEl.videoWidth > 0) {
+              clearVideoRecoveryTimer()
+              videoRecoveryAttemptsRef.current = 0
+            }
+          }
+          videoEl.onplaying = () => {
+            if (videoEl.videoWidth > 0) {
+              clearVideoRecoveryTimer()
+              videoRecoveryAttemptsRef.current = 0
+            }
+          }
           setConnected(true)
           setConnectionState('connected')
         }
@@ -169,6 +216,32 @@ export default function SessionPage() {
 
       await webrtcManager.createOffer()
       setConnectionState('negotiating')
+
+      videoRecoveryTimerRef.current = window.setTimeout(() => {
+        const videoEl = videoRef.current
+        if (!videoEl || videoEl.videoWidth > 0) {
+          clearVideoRecoveryTimer()
+          videoRecoveryAttemptsRef.current = 0
+          return
+        }
+
+        if (videoRecoveryAttemptsRef.current >= 2) {
+          setConnectionState('failed')
+          setError('Connected but no video frames received. Please reconnect.')
+          return
+        }
+
+        videoRecoveryAttemptsRef.current += 1
+        console.warn(
+          `No playable video detected, renegotiating WebRTC (attempt ${videoRecoveryAttemptsRef.current})`
+        )
+        if (webrtcManagerRef.current) {
+          webrtcManagerRef.current.close()
+          webrtcManagerRef.current = null
+        }
+        setConnectionState('recovering')
+        void startWebRTC(true)
+      }, 9000)
     } catch (err) {
       setConnectionState('failed')
       setError('Failed to establish WebRTC connection')
@@ -185,6 +258,8 @@ export default function SessionPage() {
 
   const cleanup = () => {
     clearSessionTimeout()
+    clearVideoRecoveryTimer()
+    sessionAcceptedRef.current = false
     if (webrtcManagerRef.current) {
       webrtcManagerRef.current.close()
     }

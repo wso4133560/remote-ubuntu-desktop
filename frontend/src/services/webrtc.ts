@@ -50,6 +50,9 @@ export class WebRTCManager {
 
     this.peerConnection = new RTCPeerConnection(configuration)
 
+    // Ensure offer always contains a stable video m-line for remote desktop stream.
+    this.peerConnection.addTransceiver('video', { direction: 'recvonly' })
+
     this.peerConnection.onicecandidate = (event) => {
       if (event.candidate) {
         this.signalingClient.sendICECandidate(this.sessionId, event.candidate)
@@ -121,10 +124,7 @@ export class WebRTCManager {
       throw new Error('PeerConnection not initialized')
     }
 
-    const offer = await this.peerConnection.createOffer({
-      offerToReceiveVideo: true,
-      offerToReceiveAudio: true,
-    })
+    const offer = await this.peerConnection.createOffer()
 
     await this.peerConnection.setLocalDescription(offer)
     this.signalingClient.sendSDPOffer(this.sessionId, offer.sdp!)

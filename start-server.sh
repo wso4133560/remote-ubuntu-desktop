@@ -19,4 +19,20 @@ fi
 
 # 设置 PYTHONPATH 并启动服务器
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-uvicorn server.main:app --host 0.0.0.0 --port 8000 --reload
+
+SERVER_HOST="${RC_SERVER_HOST:-0.0.0.0}"
+SERVER_PORT="${RC_SERVER_PORT:-8000}"
+
+if [ "${RC_SERVER_RELOAD:-0}" = "1" ]; then
+    echo "Dev reload enabled (RC_SERVER_RELOAD=1)"
+    uvicorn server.main:app \
+        --host "${SERVER_HOST}" \
+        --port "${SERVER_PORT}" \
+        --reload \
+        --reload-include "*.py" \
+        --reload-exclude "remote_control.db"
+else
+    uvicorn server.main:app \
+        --host "${SERVER_HOST}" \
+        --port "${SERVER_PORT}"
+fi

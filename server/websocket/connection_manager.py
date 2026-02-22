@@ -1,6 +1,6 @@
 """WebSocket 连接管理"""
 import asyncio
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 from fastapi import WebSocket
 from datetime import datetime
 
@@ -13,7 +13,7 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
         self.device_connections: Dict[str, str] = {}
-        self.user_connections: Dict[str, str] = {}
+        self.user_connections: Dict[str, Set[str]] = {}
         self.heartbeat_tasks: Dict[str, asyncio.Task] = {}
         self.ack_managers: Dict[str, AckManager] = {}
 
@@ -32,8 +32,12 @@ class ConnectionManager:
             logger.info(f"Device connected: {client_id} -> {connection_id}")
             logger.info(f"Active device connections: {list(self.device_connections.keys())}")
         elif client_type == "user":
-            self.user_connections[client_id] = connection_id
-            logger.info(f"User connected: {client_id} -> {connection_id}")
+            if client_id not in self.user_connections:
+                self.user_connections[client_id] = set()
+            self.user_connections[client_id].add(connection_id)
+            logger.info(
+                f"User connected: {client_id} -> {connection_id}, total={len(self.user_connections[client_id])}"
+            )
 
         async def send_callback(message: dict):
             await self.send_message(connection_id, message)
@@ -55,9 +59,11 @@ class ConnectionManager:
                 del self.device_connections[device_id]
                 print(f"[DEBUG] device_connections now: {dict(self.device_connections)}", flush=True)
 
-        for user_id, conn_id in list(self.user_connections.items()):
-            if conn_id == connection_id:
-                del self.user_connections[user_id]
+        for user_id, conn_ids in list(self.user_connections.items()):
+            if connection_id in conn_ids:
+                conn_ids.discard(connection_id)
+                if not conn_ids:
+                    del self.user_connections[user_id]
 
         if connection_id in self.heartbeat_tasks:
             self.heartbeat_tasks[connection_id].cancel()
@@ -91,10 +97,15 @@ class ConnectionManager:
 
     async def send_to_user(self, user_id: str, message: dict) -> bool:
         """发送消息到用户"""
-        connection_id = self.user_connections.get(user_id)
-        if connection_id:
-            return await self.send_message(connection_id, message)
-        return False
+        connection_ids = self.user_connections.get(user_id)
+        if not connection_ids:
+            return False
+
+        delivered = False
+        for connection_id in list(connection_ids):
+            ok = await self.send_message(connection_id, message)
+            delivered = delivered or ok
+        return delivered
 
     async def broadcast_to_users(self, message: dict) -> None:
         """广播消息给所有在线用户"""
@@ -125,8 +136,11 @@ class ConnectionManager:
         return self.device_connections.get(device_id)
 
     def get_user_connection_id(self, user_id: str) -> Optional[str]:
-        """获取用户的连接 ID"""
-        return self.user_connections.get(user_id)
+        """获取用户的任一连接 ID（兼容旧接口）"""
+        connections = self.user_connections.get(user_id)
+        if not connections:
+            return None
+        return next(iter(connections))
 
     def is_device_online(self, device_id: str) -> bool:
         """检查设备是否在线"""

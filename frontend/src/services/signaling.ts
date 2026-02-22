@@ -6,43 +6,86 @@ export class SignalingClient {
   private reconnectAttempts = 0
   private maxReconnectAttempts = 6
   private messageHandlers: Map<MessageType, (message: any) => void> = new Map()
+  private shouldReconnect = true
 
   constructor(private token: string) {}
 
-  connect(): Promise<void> {
+  connect(timeoutMs = 15000): Promise<void> {
+    this.shouldReconnect = true
+    const deadline = Date.now() + timeoutMs
+
     return new Promise((resolve, reject) => {
-      const wsUrl = window.location.protocol === 'https:' ? 'wss://' : 'ws://'
-      const wsHost = window.location.host
-      this.ws = new WebSocket(`${wsUrl}${wsHost}/ws?token=${this.token}`)
+      let settled = false
 
-      this.ws.onopen = () => {
-        console.log('WebSocket connected')
-        this.reconnectAttempts = 0
-        resolve()
-      }
+      const attemptConnect = () => {
+        const wsUrl = window.location.protocol === 'https:' ? 'wss://' : 'ws://'
+        const wsHost = window.location.host
+        const ws = new WebSocket(`${wsUrl}${wsHost}/ws?token=${this.token}`)
+        this.ws = ws
 
-      this.ws.onerror = (error) => {
-        console.error('WebSocket error:', error)
-        reject(error)
-      }
+        let opened = false
+        const attemptTimeout = window.setTimeout(() => {
+          if (!opened && ws.readyState !== WebSocket.CLOSED) {
+            ws.close()
+          }
+        }, 4000)
 
-      this.ws.onclose = () => {
-        console.log('WebSocket closed')
-        this.handleReconnect()
-      }
+        ws.onopen = () => {
+          window.clearTimeout(attemptTimeout)
+          opened = true
+          this.reconnectAttempts = 0
+          console.log('WebSocket connected')
+          if (!settled) {
+            settled = true
+            resolve()
+          }
+        }
 
-      this.ws.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data)
-          this.handleMessage(message)
-        } catch (err) {
-          console.error('Failed to parse message:', err)
+        ws.onerror = (error) => {
+          console.error('WebSocket error:', error)
+        }
+
+        ws.onclose = () => {
+          window.clearTimeout(attemptTimeout)
+
+          if (opened) {
+            console.log('WebSocket closed')
+            if (this.shouldReconnect) {
+              this.handleReconnect()
+            }
+            return
+          }
+
+          if (Date.now() >= deadline) {
+            if (!settled) {
+              settled = true
+              reject(new Error('WebSocket connection timeout'))
+            }
+            return
+          }
+
+          const delay = Math.min(Math.pow(2, this.reconnectAttempts) * 500, 2000)
+          this.reconnectAttempts++
+          console.warn(`WebSocket connect attempt failed, retrying in ${delay}ms...`)
+          window.setTimeout(attemptConnect, delay)
+        }
+
+        ws.onmessage = (event) => {
+          try {
+            const message = JSON.parse(event.data)
+            this.handleMessage(message)
+          } catch (err) {
+            console.error('Failed to parse message:', err)
+          }
         }
       }
+
+      attemptConnect()
     })
   }
 
   disconnect() {
+    this.shouldReconnect = false
     if (this.ws) {
       this.ws.close()
       this.ws = null
@@ -120,6 +163,10 @@ export class SignalingClient {
   }
 
   private handleReconnect() {
+    if (!this.shouldReconnect) {
+      return
+    }
+
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       console.error('Max reconnect attempts reached')
       return

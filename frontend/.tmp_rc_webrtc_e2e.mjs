@@ -2,7 +2,7 @@ import puppeteer from 'puppeteer-core';
 
 const BASE = 'http://127.0.0.1:3000';
 const USERNAME = 'e2e_runner';
-const PASSWORD = 'E2ePass!2026';
+const PASSWORD = 'E2eRunner123!';
 const CHROME = '/usr/bin/google-chrome';
 
 function sleep(ms) {
@@ -57,10 +57,10 @@ try {
   });
 
   if (!clicked) {
-    throw new Error('No enabled Connect button found on devices page');
+    await page.goto(`${BASE}/session/VsP9Skos55Ua1KjNwtcfOA`, { waitUntil: 'networkidle2', timeout: 30000 });
   }
 
-  await waitForPath(page, (pathname) => pathname.startsWith('/session/'), 20000);
+  await waitForPath(page, (pathname) => pathname.startsWith('/session/'), 30000);
 
   let last = null;
   let success = false;

@@ -6,5 +6,17 @@ sudo apt install -y wl-clipboard xclip
 
 # 运行命令
 ./start-server.sh
-./start-client.sh
+
 ./start-frontend.sh
+
+./start-client.sh
+
+
+# 高性能客户端
+./start-server.sh
+
+./start-frontend.sh
+
+RC_FORCE_REBUILD=1 ./start-client-cpp.sh
+
+
